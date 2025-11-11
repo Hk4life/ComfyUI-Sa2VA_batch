@@ -902,79 +902,97 @@ class Sa2VANodeTpl:
                 print(f"⚠️ {error_msg}")
                 return ([error_msg], [])
 
-            if not be_quiet:
-                print(f"🔄 Processing image | Segmentation: {segmentation_mode}")
-
-            # Convert ComfyUI image tensor to PIL Image
+            # Determine batch size
+            batch_size = 1
             if hasattr(image, "shape") and len(image.shape) == 4:
-                # ComfyUI image format: (batch, height, width, channels)
-                img_t = image[0]
-            elif hasattr(image, "shape") and len(image.shape) == 3:
-                # Single image: (height, width, channels)
-                img_t = image
-            else:
-                error_msg = f"Unsupported image format: {type(image)}"
-                print(f"❌ {error_msg}")
-                return ([error_msg], [])
+                batch_size = image.shape[0]
+            
+            if not be_quiet:
+                print(f"🔄 Processing {batch_size} image(s) | Segmentation: {segmentation_mode}")
 
-            # Offload image tensor to CPU and release GPU memory promptly
-            if isinstance(img_t, torch.Tensor):
-                try:
-                    if offload_input_to_cpu and img_t.is_cuda:
-                        img_cpu = img_t.detach().to("cpu")
-                        del img_t
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            if hasattr(torch.cuda, "ipc_collect"):
-                                torch.cuda.ipc_collect()
-                        img_t = img_cpu
-                    else:
-                        img_t = img_t.detach().cpu()
-                except Exception:
-                    # Fallback to plain .cpu()
-                    img_t = img_t.cpu()
-                image_np = img_t.numpy()
-                # Help GC promptly
-                del img_t
-            else:
-                error_msg = f"Unsupported image tensor type: {type(image)}"
-                print(f"❌ {error_msg}")
-                return ([error_msg], [])
+            # Process all images in batch
+            text_outputs = []
+            all_masks = []
+            h, w = 0, 0
 
-            # Convert to PIL Image
-            if image_np.dtype != "uint8":
-                image_np = (image_np * 255).astype("uint8")
-
-            pil_image = Image.fromarray(image_np)
-
-            # Process the single image with memory-friendly contexts
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if use_autocast and device == "cuda":
-                if autocast_dtype == "float16":
-                    _amp_dtype = torch.float16
-                elif autocast_dtype == "bfloat16" or autocast_dtype == "auto":
-                    _amp_dtype = torch.bfloat16
+            for batch_idx in range(batch_size):
+                # Convert ComfyUI image tensor to PIL Image
+                if hasattr(image, "shape") and len(image.shape) == 4:
+                    # ComfyUI image format: (batch, height, width, channels)
+                    img_t = image[batch_idx]
+                elif hasattr(image, "shape") and len(image.shape) == 3:
+                    # Single image: (height, width, channels)
+                    img_t = image
                 else:
-                    _amp_dtype = torch.bfloat16
-                autocast_ctx = torch.cuda.amp.autocast(dtype=_amp_dtype)
-            else:
-                autocast_ctx = nullcontext()
+                    error_msg = f"Unsupported image format: {type(image)}"
+                    print(f"❌ {error_msg}")
+                    return ([error_msg], [])
 
-            inference_ctx = (
-                torch.inference_mode() if use_inference_mode else nullcontext()
-            )
+                # Offload image tensor to CPU and release GPU memory promptly
+                if isinstance(img_t, torch.Tensor):
+                    try:
+                        if offload_input_to_cpu and img_t.is_cuda:
+                            img_cpu = img_t.detach().to("cpu")
+                            del img_t
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                if hasattr(torch.cuda, "ipc_collect"):
+                                    torch.cuda.ipc_collect()
+                            img_t = img_cpu
+                        else:
+                            img_t = img_t.detach().cpu()
+                    except Exception:
+                        # Fallback to plain .cpu()
+                        img_t = img_t.cpu()
+                    image_np = img_t.numpy()
+                    # Help GC promptly
+                    del img_t
+                else:
+                    error_msg = f"Unsupported image tensor type: {type(image)}"
+                    print(f"❌ {error_msg}")
+                    return ([error_msg], [])
 
-            with inference_ctx:
-                with autocast_ctx:
-                    text_output, masks = self.process_single_image(
-                        pil_image, text_prompt, segmentation_mode, segmentation_prompt
-                    )
+                # Convert to PIL Image
+                if image_np.dtype != "uint8":
+                    image_np = (image_np * 255).astype("uint8")
 
-            text_outputs = [text_output]
-            all_masks = masks if masks else []
+                pil_image = Image.fromarray(image_np)
 
-            # Get input dimensions for mask sizing
-            h, w = int(image_np.shape[0]), int(image_np.shape[1])
+                # Store dimensions (same for all images in batch)
+                if batch_idx == 0:
+                    h, w = int(image_np.shape[0]), int(image_np.shape[1])
+
+                # Process the image with memory-friendly contexts
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                if use_autocast and device == "cuda":
+                    if autocast_dtype == "float16":
+                        _amp_dtype = torch.float16
+                    elif autocast_dtype == "bfloat16" or autocast_dtype == "auto":
+                        _amp_dtype = torch.bfloat16
+                    else:
+                        _amp_dtype = torch.bfloat16
+                    autocast_ctx = torch.cuda.amp.autocast(dtype=_amp_dtype)
+                else:
+                    autocast_ctx = nullcontext()
+
+                inference_ctx = (
+                    torch.inference_mode() if use_inference_mode else nullcontext()
+                )
+
+                with inference_ctx:
+                    with autocast_ctx:
+                        text_output, masks = self.process_single_image(
+                            pil_image, text_prompt, segmentation_mode, segmentation_prompt
+                        )
+
+                text_outputs.append(text_output)
+                
+                # Add masks from this image to the collection
+                if masks:
+                    all_masks.extend(masks)
+                
+                if not be_quiet:
+                    print(f"   Image {batch_idx + 1}/{batch_size} processed: {len(masks) if masks else 0} masks")
 
             # Always ensure we have masks in segmentation mode
             if segmentation_mode and len(all_masks) == 0:
